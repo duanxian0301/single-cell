@@ -1,0 +1,323 @@
+#清空环境加载需要的R包----
+rm(list=ls())
+options(stringsAsFactors = F) 
+source('scRNA_scripts/lib.R')
+getwd()
+
+#读取数据创建seurat对象----
+dir='./GSE254569_adata_RNA.h5ad/'
+samples=list.files( dir  )
+samples
+#samples=samples[1:2]
+sceList = lapply(samples,function(pro){ 
+  # pro=samples[1] 
+  print(pro)  
+  ct = Read10X(file.path(dir,pro ) ) 
+  print(dim(ct))
+  sce =CreateSeuratObject(counts =  ct ,
+                          project =  gsub('GSM[0-9]*_','',pro),
+                          min.cells = 5,
+                          min.features = 300 )
+  return(sce)
+}) 
+
+do.call(rbind,lapply(sceList, dim)) 
+
+##多样品数据合并----
+sce.all=merge(x=sceList[[1]],
+              y=sceList[ -1 ],  
+              add.cell.ids = samples )
+
+names(sce.all@assays$RNA@layers)
+
+# Alternate accessor function with the same result
+LayerData(sce.all,assay = "RNA", layer = "counts")
+sce.all <- JoinLayers(sce.all)
+dim(sce.all[["RNA"]]$counts )
+
+#查看seurat对象的基本信息
+as.data.frame(sce.all@assays$RNA$counts[1:10, 1:2])
+head(sce.all@meta.data, 10)
+table(sce.all$orig.ident) 
+
+##分组信息整理----
+#通常是隐含在文件名,样品名字里面
+
+phe = sce.all@meta.data
+table(phe$orig.ident)
+
+# 创建 GEO ID 到分组的映射表（完整版）
+group <- c(
+  )
+
+# 验证分组数量
+table(group)
+
+# 根据 orig.ident 列为每个样本分配分组
+phe$group <- group[phe$orig.ident]
+
+
+# 检查分组情况
+table(phe$group)
+
+# 更新 sce.all 的 meta.data
+sce.all@meta.data <- phe
+
+
+
+sp='human'
+
+#QC质控----
+dir.create("./1-QC")
+
+# 如果过滤的太狠，就需要去修改这个过滤代码
+source('./scRNA_scripts/qc.R')
+sce.all.filt = basic_qc(sce.all)
+print(dim(sce.all))
+print(dim(sce.all.filt))
+
+##基于文献质控标准调整----
+sce.all.filt
+tmp=subset(sce.all.filt,subset = percent_mito < 5 &
+             nCount_RNA <25000 &
+             nFeature_RNA <6000 &
+             nFeature_RNA>200)
+tmp
+
+sort(table(tmp$orig.ident))
+sce.all.filt =tmp
+
+head(sce.all.filt@meta.data)
+sce.all.filt$batch <- "Batch1"  # 将 "Batch1" 替换为实际的批次标签
+table(sce.all.filt$orig.ident)
+table(sce.all.filt$lib_batch)
+table(sce.all.filt$Donor)
+# 使用 lib_batch 作为批次变量
+# 使用 lib_batch 作为批次变量
+batch_var <- "lib_batch"
+
+
+# harmony整合去批次----
+dir.create("2-harmony", showWarnings = FALSE)  # 创建目录（不显示警告）
+setwd("E:/SJ/单细胞")  # 设置工作目录
+source('./harmony.R')  # 加载 Harmony 脚本
+
+# 数据预处理（确保数据已标准化、归一化、PCA 处理）
+sce.all.filt <- NormalizeData(sce.all.filt)  # 归一化数据
+sce.all.filt <- FindVariableFeatures(sce.all.filt)  # 查找高变基因
+sce.all.filt <- ScaleData(sce.all.filt, vars.to.regress = c("nCount_RNA", "nFeature_RNA"))  # 缩放数据并回归 nCount_RNA 和 nFeature_RNA
+sce.all.filt <- RunPCA(sce.all.filt, npcs = 30)  # 运行 PCA，保留 30 个主成分
+
+# 检查 PCA 结果
+DimPlot(sce.all.filt, reduction = "pca")  # 可视化 PCA
+
+# 设置批次变量
+batch_var <- "lib_batch"  # 替换为实际的批次变量列名
+if (!batch_var %in% colnames(sce.all.filt@meta.data)) {
+  stop(paste("批次变量", batch_var, "不存在于元数据中！"))
+}
+
+# 运行 Harmony 校正
+sce.all.int <- run_harmony(sce.all.filt, batch_var = batch_var)
+
+# 检查 Harmony 校正结果
+DimPlot(sce.all.int, reduction = "harmony")  # 可视化 Harmony 校正结果
+
+# 聚类分析
+sce.all.int <- FindNeighbors(sce.all.int, dims = 1:30)  # 使用 Harmony 校正后的降维结果
+sce.all.int <- FindClusters(sce.all.int, resolution = 0.1)  # 设置分辨率为 0.1
+
+# 检查聚类结果
+table(Idents(sce.all.int))
+table(sce.all.int$seurat_clusters)
+table(sce.all.int$RNA_snn_res.0.1)
+table(sce.all.int$RNA_snn_res.0.8)
+
+### check-by-0.1 ----
+getwd()
+dir.create('check-by-0.1', showWarnings = FALSE)  # 创建目录（不显示警告）
+setwd('check-by-0.1')
+
+# 设置分辨率为 0.1
+sel.clust <- "RNA_snn_res.0.1"
+sce.all.int <- SetIdent(sce.all.int, value = sel.clust)
+table(sce.all.int@active.ident)
+
+# 查找标记基因
+markers <- FindAllMarkers(sce.all.int, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+head(markers)
+
+# 保存标记基因结果
+write.csv(markers, "markers_0.1.csv", row.names = FALSE)
+
+# 可视化标记基因
+DoHeatmap(sce.all.int, features = markers$gene[1:10])
+
+# 返回上一级目录
+setwd('../')
+getwd()
+
+# 最后检查标记基因
+last_markers_to_check <- markers
+# 保存 sce.all.int 对象
+saveRDS(sce.all.int, file = "sce.all.int.rds")
+
+# 如果需要加载保存的对象，可以使用以下代码：
+# sce.all.int <- readRDS("sce.all.int.rds")
+
+
+#确定单细胞亚群生物学名字----
+# 一般来说，为了节省工作量，我们选择0.1的分辨率进行命名
+# 因为命名这个步骤是纯人工 操作
+# 除非0.1确实分群太粗狂了，我们就选择0.8 
+
+source('lib.R')
+# sce.all.int = readRDS('2-harmony/sce.all_int.rds')
+# sp='human'
+# colnames(sce.all.int@meta.data)
+table(sce.all.int$RNA_snn_res.0.1)
+
+sel.clust = "RNA_snn_res.0.1"
+sce.all.int <- SetIdent(sce.all.int, value = sel.clust)
+table(sce.all.int@active.ident) 
+colnames(sce.all.int@meta.data) 
+
+
+# 定义完整的标记基因列表（按细胞类型分组）
+genes_to_check <- c(
+  # 少突胶质细胞 & 前体细胞 / Oligodendrocytes & Progenitors
+  'OLIG1',  # 少突胶质细胞标记 / Oligodendrocyte marker
+  'OLIG2',  # 少突胶质细胞发育关键因子 / Key regulator of oligodendrocyte development
+  'SOX10',  # 神经嵴和胶质细胞转录因子 / Neural crest and glial cell TF
+  'PDGFRA', # 少突胶质前体细胞标记 / Oligodendrocyte precursor cell (OPC) marker
+  'CSPG4',  # 神经胶质抗原NG2 / Neural/glial antigen NG2
+  'MBP',    # 髓鞘碱性蛋白 / Myelin basic protein
+  'PLP1',   # 蛋白脂质蛋白1 / Proteolipid protein 1
+  'MOG',    # 髓鞘少突胶质细胞糖蛋白 / Myelin oligodendrocyte glycoprotein
+  
+  # 星形胶质细胞 / Astrocytes
+  'GFAP',   # 胶质纤维酸性蛋白 / Glial fibrillary acidic protein
+  'AQP4',   # 水通道蛋白4 / Aquaporin-4 (water channel)
+  'SLC1A3', # 谷氨酸转运体EAAT1 / Glutamate transporter EAAT1
+  'ALDH1L1',# 星形胶质特异性代谢酶 / Astrocyte-specific metabolic enzyme
+  'SLC4A4', # 钠碳酸氢盐共转运体 / Sodium bicarbonate cotransporter
+  'GLUL',   # 谷氨酰胺合成酶 / Glutamine synthetase
+  
+  # 小胶质细胞 / Microglia
+  'P2RY12', # 嘌呤能受体P2Y12 / Purinergic receptor P2Y12
+  'TMEM119',# 跨膜蛋白119 / Transmembrane protein 119
+  'CX3CR1', # 趋化因子受体CX3CR1 / Chemokine receptor CX3CR1
+  'CSF1R',  # 集落刺激因子1受体 / Colony stimulating factor 1 receptor
+  'C1QA',   # 补体成分C1qA / Complement component C1q A chain
+  'C1QB',   # 补体成分C1qB / Complement component C1q B chain
+  
+  # 血管细胞 / Vascular cells
+  'CLDN5',  # 紧密连接蛋白claudin-5 / Tight junction protein claudin-5
+  'FLT1',   # VEGF受体1 / VEGF receptor 1
+  'PECAM1', # CD31内皮标记 / CD31 endothelial marker
+  'CD34',   # 造血干细胞/内皮标记 / Hematopoietic/endothelial marker
+  'ESAM',   # 内皮细胞粘附分子 / Endothelial cell adhesion molecule
+  'VWF',    # 血管性血友病因子 / von Willebrand factor
+  
+  # 神经前体细胞 / Neural progenitors
+  'ASCL1',  # 神经发生关键转录因子 / Proneural transcription factor
+  'DCX',    # 双皮质素 / Doublecortin (immature neuron marker)
+  'SOX2',   # 多能干细胞维持因子 / Pluripotency maintenance factor
+  'NES',    # 巢蛋白 / Nestin (neural stem cell marker)
+  'TUBB3',  # 神经元特异性β微管蛋白 / Neuron-specific beta-tubulin
+  'STMN2',  # 突触生长相关蛋白SCG10 / Synaptogenesis regulator SCG10
+  
+  # 兴奋性神经元 / Excitatory neurons
+  'SLC17A7',# 谷氨酸转运体VGLUT1 / Vesicular glutamate transporter 1
+  'SLC17A6',# 谷氨酸转运体VGLUT2 / Vesicular glutamate transporter 2
+  'SLC17A8',# 谷氨酸转运体VGLUT3 / Vesicular glutamate transporter 3
+  'NEUROD2',# 神经元分化因子 / Neuronal differentiation factor
+  'SLC1A1', # 谷氨酸转运体EAAT3 / Excitatory amino acid transporter 3
+  'SLC1A2', # 谷氨酸转运体EAAT2 / Excitatory amino acid transporter 2
+  
+  # 抑制性神经元 / Inhibitory neurons
+  'GAD1',   # 谷氨酸脱羧酶67 / Glutamic acid decarboxylase 67
+  'GAD2',   # 谷氨酸脱羧酶65 / Glutamic acid decarboxylase 65
+  'SST',    # 生长抑素 / Somatostatin
+  'PVALB',  # 小白蛋白 / Parvalbumin
+  'VIP',    # 血管活性肠肽 / Vasoactive intestinal peptide
+  'LHX6'    # GABA能神经元发育调控因子 / GABAergic neuron development regulator
+)
+
+genes_to_check=str_to_upper(genes_to_check)
+genes_to_check
+
+p = DotPlot(sce.all.int, features = unique(genes_to_check),
+            assay='RNA'  )  + coord_flip()
+p
+
+sce.all.int <- RunUMAP(sce.all.int, dims = 1:10) # 根据你的数据调整 dims 参数
+print(p_umap)
+# 保存 UMAP 图为 PDF 文件
+ggsave("umap_plot.pdf", plot = p_umap, width = 10, height = 8)
+##手动给各个单细胞亚群命名----
+if(T){
+  sce.all.int
+  celltype=data.frame(ClusterID=0:10,
+                      celltype=0:10 ) 
+  #定义细胞亚群        
+  celltype[celltype$ClusterID %in% c( 2,9  ),2]='Astrocytes'
+  celltype[celltype$ClusterID %in% c( 1  ),2]='Oligodendrocytes'
+  celltype[celltype$ClusterID %in% c( 7,8,18 ),2]='Progenitor_cells'
+  celltype[celltype$ClusterID %in% c( 6,16 ),2]='Microglia'
+  celltype[celltype$ClusterID %in% c( 12 ),2]='Vascular_cells'
+  celltype[celltype$ClusterID %in% c( 0,10,11,13,17 ),2]='Excitatory_neurons'
+  celltype[celltype$ClusterID %in% c( 3,4,14,15 ),2]='Inhibitory_neurons'
+  celltype[celltype$ClusterID %in% c( 5 ),2]='Oligodendrocytes_Progenitors'
+  #修改亚群名字
+  head(celltype)
+  celltype
+  table(celltype$celltype)
+  sce.all.int@meta.data$celltype = "NA"
+  
+  for(i in 1:nrow(celltype)){
+    sce.all.int@meta.data[which(sce.all.int@meta.data$RNA_snn_res.0.1 == celltype$ClusterID[i]),'celltype'] <- celltype$celltype[i]}
+  Idents(sce.all.int)=sce.all.int$celltype
+}
+
+
+##基于注释后的结果可视化----
+if("celltype" %in% colnames(sce.all.int@meta.data ) ){
+  
+  sel.clust = "celltype"
+  sce.all.int <- SetIdent(sce.all.int, value = sel.clust)
+  table(sce.all.int@active.ident) 
+  
+  phe=sce.all.int@meta.data
+  save(phe,file = 'phe.Rdata')
+  pdf('celltype-vs-orig.ident.pdf',width = 10)
+  gplots::balloonplot(table(sce.all.int$celltype,sce.all.int$orig.ident))
+  dev.off()
+  dir.create('check-by-celltype')
+  setwd('E:/SJ/单细胞/check-by-celltype')
+  source('check-all-markers-AD.R')
+  setwd('../') 
+  getwd()
+}
+
+saveRDS(sce.all.int, "sce_celltype.rds")
+
+##harmony与否区别----
+seuratObj <- RunUMAP(sce.all.int,  
+                     reduction = "pca",
+                     dims = 1:15 )
+colnames(sce.all.int@meta.data)
+p3=DimPlot(sce.all.int, reduction = "umap",
+           group.by = "celltype" ) #+ NoLegend()
+p4=DimPlot(seuratObj, reduction = "umap" ,
+           group.by = "celltype")+ NoLegend()
+
+p1=DimPlot(sce.all.int, reduction = "umap",
+           group.by = "orig.ident" )+ NoLegend()
+p2=DimPlot(seuratObj, reduction = "umap" ,
+           group.by = "orig.ident")+ NoLegend()
+
+(p1+p2)/(p3+p4)
+ggsave('harmony-or-not.pdf',width = 12,height = 12)
+
+
